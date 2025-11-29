@@ -1,14 +1,3 @@
-# Option_A_streamlit_deploy.py
-# Streamlit deployment app (Option A)
-# Features:
-# - Upload CSV (Date, Close) or use default AAPL.csv if present
-# - Train LSTM (or load saved model) and cache it
-# - User can select a specific date to get predicted price and actual (if available)
-# - Small "selected-day" actual vs predicted plot
-# - Small 30-day future forecast sparkline
-# - Full forecast up to 90 days (user-selectable)
-# - Button to save requirements.txt to disk
-
 import streamlit as st
 import pandas as pd
 import numpy as np
