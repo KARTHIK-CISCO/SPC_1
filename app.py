@@ -232,7 +232,7 @@ if days_ahead <= 0:
 
 else:
     # Future date selected
-    if days_ahead > 90:
+    if days_ahead > 150:
         st.error("This app supports forecasting up to 90 days into the future. Choose a nearer date.")
     else:
         # iterative forecast up to days_ahead (or up to horizon_days whichever smaller)
