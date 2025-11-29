@@ -169,7 +169,7 @@ if days_ahead <= 0 and len(idx) > 0:
         y=[actual],
         mode='markers+lines',
         name='Actual',
-        marker=dict(color='blue', size=10)
+        marker=dict(color='red', size=10)
     ))
     fig.add_trace(go.Scatter(
         x=[selected_date],
