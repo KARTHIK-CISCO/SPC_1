@@ -7,8 +7,9 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from datetime import datetime, timedelta
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="LSTM Stock Forecast - Clean Version", layout="wide")
+st.set_page_config(page_title="LSTM Stock Forecast", layout="wide")
 
 # --------------------------- Helper Functions ---------------------------
 @st.cache_data(show_spinner=False)
@@ -27,14 +28,12 @@ def load_csv(uploaded_file):
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
-
 def create_sequences(values, seq_len=60):
     X, y = [], []
     for i in range(seq_len, len(values)):
         X.append(values[i - seq_len:i, 0])
         y.append(values[i, 0])
     return np.array(X).reshape(-1, seq_len, 1), np.array(y)
-
 
 def build_and_train_lstm(X_train, y_train, epochs=25, batch_size=32):
     model = Sequential([
@@ -50,7 +49,6 @@ def build_and_train_lstm(X_train, y_train, epochs=25, batch_size=32):
               validation_split=0.05, shuffle=False, verbose=0)
     return model
 
-
 def iterative_forecast(model, last_seq_scaled, steps, scaler):
     seq = last_seq_scaled.reshape(1, -1, 1)
     preds_scaled = []
@@ -61,12 +59,10 @@ def iterative_forecast(model, last_seq_scaled, steps, scaler):
     preds_scaled = np.array(preds_scaled).reshape(-1, 1)
     return scaler.inverse_transform(preds_scaled)
 
-
 # --------------------------- Main App ---------------------------
-st.title("📈 LSTM Stock Forecast (No Graphs, No Sidebar, No Saved Models)")
+st.title("📈 LSTM Stock Forecast with Prediction Graph")
 
 uploaded_file = st.file_uploader("Upload CSV (must include Date & Close)", type=["csv"])
-
 df = load_csv(uploaded_file)
 if df is None:
     st.stop()
@@ -98,7 +94,6 @@ if "model_trained" not in st.session_state:
     st.session_state.model_trained = False
     st.session_state.model = None
 
-# Train button
 if st.button("🔄 Retrain LSTM Model"):
     with st.spinner("Training LSTM model..."):
         st.session_state.model = build_and_train_lstm(X_train, y_train, epochs=25)
@@ -135,7 +130,6 @@ st.header("Predict Any Date")
 
 selected_date = st.date_input("Select a date (past or future)", value=last_date.date())
 selected_date = pd.to_datetime(selected_date)
-
 days_ahead = (selected_date - last_date).days
 
 if days_ahead <= 0:
@@ -155,7 +149,8 @@ if days_ahead <= 0:
             st.subheader(f"Prediction for {selected_date.date()}")
             st.write(f"**Actual:** {actual:.4f}")
             st.write(f"**Predicted:** {pred:.4f}")
-else:
+
+elif days_ahead > 0:
     if days_ahead > 90:
         st.error("Forecast beyond 90 days is not supported.")
     else:
@@ -164,20 +159,33 @@ else:
         st.subheader(f"Prediction for {selected_date.date()} ({days_ahead} days ahead)")
         st.write(f"**Predicted:** {pred_val:.4f}")
 
-# --------------------------- 30-Day Forecast Download ---------------------------
-st.header("Download 30-Day Forecast")
+# --------------------------- Prediction Graph ---------------------------
+st.header("Prediction Graph")
 
-future30 = iterative_forecast(model, scaled[-seq_len:], 30, scaler)
-dates30 = [last_date + timedelta(days=i + 1) for i in range(30)]
+if days_ahead <= 0 and len(idx) > 0:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=[selected_date],
+        y=[actual],
+        mode='markers+lines',
+        name='Actual',
+        marker=dict(color='blue', size=10)
+    ))
+    fig.add_trace(go.Scatter(
+        x=[selected_date],
+        y=[pred],
+        mode='markers+lines',
+        name='Predicted',
+        marker=dict(color='red', size=10)
+    ))
+    fig.update_layout(
+        title=f"Actual vs Predicted Close Price on {selected_date.date()}",
+        xaxis_title="Date",
+        yaxis_title="Close Price",
+        showlegend=True
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-df30 = pd.DataFrame({"Date": dates30, "Predicted_Close": future30.flatten()})
-csv30 = df30.to_csv(index=False).encode("utf-8")
-
-st.download_button(
-    "⬇ Download 30-Day Forecast CSV",
-    data=csv30,
-    file_name="30_day_forecast.csv",
-    mime="text/csv"
-)
-
-st.success("App ready. Forecasting complete.")
+elif days_ahead > 0 and days_ahead <= 90:
+    fig = go.Figure()
+    past_dates = df["Dat]()_
