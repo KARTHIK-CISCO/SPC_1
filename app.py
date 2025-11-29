@@ -1,336 +1,305 @@
+# Option_A_streamlit_deploy.py
+# Streamlit deployment app (Option A)
+# Features:
+# - Upload CSV (Date, Close) or use default AAPL.csv if present
+# - Train LSTM (or load saved model) and cache it
+# - User can select a specific date to get predicted price and actual (if available)
+# - Small "selected-day" actual vs predicted plot
+# - Small 30-day future forecast sparkline
+# - Full forecast up to 90 days (user-selectable)
+# - Button to save requirements.txt to disk
+
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, r2_score
-from statsmodels.tsa.statespace.sarimax import SARIMAX
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-from datetime import timedelta
+from datetime import datetime, timedelta
+import joblib
 
-st.set_page_config(layout="wide", page_title="Forecast App (LSTM)", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Stock Forecast - Option A", layout="wide")
 
-# ---------------------------
-# Helpers
-# ---------------------------
-@st.cache_data
-def load_data(uploaded_file):
-    if uploaded_file is None:
-        # try local file name fallback
-        try:
-            df = pd.read_csv("AAPL.csv")
-        except Exception:
-            st.error("No dataset uploaded and AAPL.csv not found. Please upload a CSV with Date and Close columns.")
-            return None
-    else:
+# --------------------------- Helpers ---------------------------
+@st.cache_data(show_spinner=False)
+def load_csv(uploaded_file):
+    if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
-    # Normalize column names
-    df.columns = [c.strip() for c in df.columns]
+    elif os.path.exists("AAPL.csv"):
+        df = pd.read_csv("AAPL.csv")
+    else:
+        st.error("No CSV uploaded and AAPL.csv not found in working dir.")
+        return None
+
+    # require Date and Close columns
     if 'Date' not in df.columns or 'Close' not in df.columns:
-        # try common variations
-        possible_date = [c for c in df.columns if 'date' in c.lower()]
-        possible_close = [c for c in df.columns if 'close' in c.lower() or 'adj close' in c.lower() or 'adj_close' in c.lower()]
-        if possible_date and possible_close:
-            df = df[[possible_date[0], possible_close[0]]].rename(columns={possible_date[0]:'Date', possible_close[0]:'Close'})
-        else:
-            st.error("CSV must contain 'Date' and 'Close' (or similar).")
-            return None
+        st.error("CSV must contain 'Date' and 'Close' columns.")
+        return None
+
     df['Date'] = pd.to_datetime(df['Date'])
     df.sort_values('Date', inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df = df[['Date','Close']].reset_index(drop=True)
     return df
 
-def train_sarima(train_values, order=(2,1,2), seasonal_order=(1,1,1,12)):
-    model = SARIMAX(train_values, order=order, seasonal_order=seasonal_order)
-    fit = model.fit(disp=False)
-    return fit
 
-@st.cache_resource
-def train_lstm_model(values, seq_len=60, epochs=30, verbose=0):
-    """
-    Train LSTM and return (model, scaler, X_train, X_test, y_train, y_test)
-    Caching avoids re-train when data unchanged.
-    """
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(values.reshape(-1,1))
-
+def create_sequences(values, seq_len=60):
     X, y = [], []
-    for i in range(seq_len, len(scaled)):
-        X.append(scaled[i-seq_len:i, 0])
-        y.append(scaled[i, 0])
+    for i in range(seq_len, len(values)):
+        X.append(values[i-seq_len:i, 0])
+        y.append(values[i, 0])
     X, y = np.array(X), np.array(y)
     X = X.reshape((X.shape[0], X.shape[1], 1))
+    return X, y
 
-    split = int(len(X) * 0.8)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
 
+@st.cache_resource(show_spinner=False)
+def build_and_train_lstm(X_train, y_train, epochs=30, batch_size=32):
     model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(seq_len,1)),
+        LSTM(64, return_sequences=True, input_shape=(X_train.shape[1], 1)),
         Dropout(0.2),
-        LSTM(64),
+        LSTM(64, return_sequences=False),
         Dropout(0.2),
-        Dense(32),
+        Dense(32, activation='relu'),
         Dense(1)
     ])
     model.compile(optimizer='adam', loss='mse')
+    model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, validation_split=0.05, shuffle=False, verbose=0)
+    return model
 
-    # Fit
-    model.fit(X_train, y_train, epochs=epochs, batch_size=32, validation_split=0.1, shuffle=False, verbose=verbose)
-    return {
-        "model": model,
-        "scaler": scaler,
-        "X_train": X_train,
-        "X_test": X_test,
-        "y_train": y_train,
-        "y_test": y_test,
-        "seq_len": seq_len
-    }
 
-def inverse_transform_array(scaler, arr):
-    return scaler.inverse_transform(np.array(arr).reshape(-1,1)).flatten()
-
-def compute_metrics(y_true, y_pred):
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    mape = mean_absolute_percentage_error(y_true, y_pred) * 100
-    r2 = r2_score(y_true, y_pred)
-    return rmse, mape, r2
-
-def forecast_lstm_sequence(model, last_seq_scaled, steps, scaler):
-    # last_seq_scaled shape: (1, seq_len, 1)
-    out = []
-    seq = last_seq_scaled.copy()
+def iterative_forecast(model, last_seq_scaled, steps, scaler):
+    # last_seq_scaled shape (seq_len, 1) or (1, seq_len, 1)
+    seq = last_seq_scaled.copy().reshape(1, last_seq_scaled.shape[0], 1)
+    preds = []
     for _ in range(steps):
-        pred_scaled = model.predict(seq, verbose=0)[0][0]
-        out.append(pred_scaled)
-        # append and shift
-        seq = np.append(seq[:,1:,:], [[[pred_scaled]]], axis=1)
-    return inverse_transform_array(scaler, out)
+        p = model.predict(seq, verbose=0)[0][0]
+        preds.append(p)
+        seq = np.append(seq[:,1:,:], [[[p]]], axis=1)
+    preds = np.array(preds).reshape(-1,1)
+    return scaler.inverse_transform(preds)
 
-# ---------------------------
-# Sidebar: Inputs
-# ---------------------------
-st.sidebar.title("Controls")
+
+# --------------------------- Sidebar ---------------------------
+st.sidebar.header("Deployment Options")
 uploaded_file = st.sidebar.file_uploader("Upload CSV (Date, Close)", type=['csv'])
-df = load_data(uploaded_file)
+seq_len = st.sidebar.number_input("Sequence length (LSTM lookback)", min_value=10, max_value=180, value=60, step=10)
+max_horizon = st.sidebar.slider("Max future forecast days", min_value=1, max_value=90, value=30)
+train_epochs = st.sidebar.number_input("Training epochs (if retrain)", min_value=1, max_value=200, value=30)
+retrain = st.sidebar.checkbox("Retrain LSTM (if you want)", value=False)
+load_saved_model = st.sidebar.checkbox("Load saved LSTM model if exists (lstm_model.h5)", value=True)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Write requirements.txt to disk"):
+    reqs = [
+        "streamlit\n",
+        "pandas\n",
+        "numpy\n",
+        "scikit-learn\n",
+        "tensorflow\n",
+        "matplotlib\n",
+        "joblib\n",
+        "statsmodels\n"
+    ]
+    with open('requirements.txt','w') as f:
+        f.writelines(reqs)
+    st.sidebar.success("requirements.txt written to disk")
+
+
+# --------------------------- Main ---------------------------
+st.title("Option A — LSTM Deployment (Selectable Day + Up to 90-day Forecast)")
+
+df = load_csv(uploaded_file)
 if df is None:
     st.stop()
 
-model_choice = st.sidebar.selectbox("Model choice", ["LSTM only", "SARIMA + LSTM"])
-seq_len = st.sidebar.number_input("Sequence length for LSTM (days)", min_value=10, max_value=120, value=60, step=5)
-epochs = st.sidebar.number_input("LSTM epochs", min_value=1, max_value=200, value=30, step=1)
-forecast_days = st.sidebar.slider("Forecast horizon (days)", 1, 90, 30)
-specific_date = st.sidebar.date_input("Select a specific date to inspect (existing or up to future forecast)", value=df['Date'].iloc[-1].date())
-run_button = st.sidebar.button("Run / Update")
+st.subheader("Data preview")
+st.dataframe(df.tail(5))
 
-# Always show some basic dataset info
-st.sidebar.markdown(f"**Dataset Range:** {df['Date'].min().date()}  →  {df['Date'].max().date()}")
-st.sidebar.markdown(f"**Total rows:** {len(df)}")
+last_date = df['Date'].max()
+st.caption(f"Dataset ends on: {last_date.date()}")
 
-# ---------------------------
-# Main
-# ---------------------------
-st.title("Time Series Forecasting (LSTM ± SARIMA)")
-st.write("Upload your CSV or use the default `AAPL.csv`. Choose model, seq length, epochs, and forecast horizon (max 90).")
+# Prepare data
+values = df[['Close']].values.astype('float32')
+scaler = MinMaxScaler()
+scaled = scaler.fit_transform(values)
 
-if run_button:
-    with st.spinner("Training models and producing forecasts... this may take a little while"):
-        values = df['Close'].values.astype(float)
+# Train/Test split (80/20)
+train_size = int(len(values) * 0.8)
 
-        # Train SARIMA on train portion if chosen
-        train_size = int(len(values) * 0.8)
-        train_vals = values[:train_size]
-        test_vals = values[train_size:]
+# Create sequences
+X, y = create_sequences(scaled, seq_len=seq_len)
+# Adjust train indices because sequences start at seq_len
+adjusted_train_size = train_size - seq_len
+if adjusted_train_size < 1:
+    st.error("Not enough data for the chosen sequence length. Reduce sequence length or upload more data.")
+    st.stop()
 
-        sarima_fit = None
-        if model_choice != "LSTM only":
-            try:
-                sarima_fit = train_sarima(train_vals.reshape(-1))
-            except Exception as e:
-                st.warning(f"SARIMA failed: {e}")
-                sarima_fit = None
+X_train, X_test = X[:adjusted_train_size], X[adjusted_train_size:]
+y_train, y_test = y[:adjusted_train_size], y[adjusted_train_size:]
 
-        # Train LSTM (cached)
-        lstm_res = train_lstm_model(values, seq_len=seq_len, epochs=epochs, verbose=0)
-        model = lstm_res["model"]
-        scaler = lstm_res["scaler"]
-        X_test = lstm_res["X_test"]
-        y_test = lstm_res["y_test"]
+# Load or train model
+model = None
+if load_saved_model and os.path.exists('lstm_model.h5'):
+    try:
+        model = load_model('lstm_model.h5')
+        st.success("Loaded saved LSTM model from lstm_model.h5")
+    except Exception as e:
+        st.warning(f"Failed to load saved model: {e}")
+        model = None
 
-        # LSTM predictions on test set
-        lstm_pred_scaled = model.predict(X_test, verbose=0)
-        lstm_pred = scaler.inverse_transform(lstm_pred_scaled).flatten()
-        y_true = scaler.inverse_transform(y_test.reshape(-1,1)).flatten()
+if model is None:
+    if retrain:
+        with st.spinner("Training LSTM model — this may take a while depending on data/epochs..."):
+            model = build_and_train_lstm(X_train, y_train, epochs=int(train_epochs))
+            model.save('lstm_model.h5')
+            st.success("Training complete — model saved as lstm_model.h5")
+    else:
+        # If not retrain and no saved model, train quickly with small epochs
+        with st.spinner("Training LSTM model (default quick training, you can retrain with sidebar)..."):
+            model = build_and_train_lstm(X_train, y_train, epochs=10)
+            model.save('lstm_model.h5')
+            st.info("Quick model trained and saved as lstm_model.h5 — consider retraining with more epochs for better accuracy")
 
-        lstm_rmse, lstm_mape, lstm_r2 = compute_metrics(y_true, lstm_pred)
+# Evaluate on test set
+with st.spinner("Evaluating model on test set..."):
+    y_pred_scaled = model.predict(X_test, verbose=0)
+    y_pred = scaler.inverse_transform(y_pred_scaled)
+    y_true = scaler.inverse_transform(y_test.reshape(-1,1))
 
-        # SARIMA predict over test period
-        sarima_pred = None
-        if sarima_fit is not None:
-            sarima_pred_vals = sarima_fit.predict(start=len(train_vals), end=len(values)-1)
-            sarima_pred = np.array(sarima_pred_vals).reshape(-1)
+    test_rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    test_mape = mean_absolute_percentage_error(y_true, y_pred) * 100
+    try:
+        test_r2 = r2_score(y_true, y_pred)
+    except:
+        test_r2 = float('nan')
 
-            sarima_rmse, sarima_mape, sarima_r2 = compute_metrics(test_vals, sarima_pred)
+# Display metrics
+col1, col2, col3 = st.columns(3)
+col1.metric("LSTM RMSE", f"{test_rmse:.4f}")
+col2.metric("LSTM MAPE (%)", f"{test_mape:.3f}")
+col3.metric("LSTM R²", f"{test_r2:.4f}")
+
+st.markdown("---")
+
+# --------------------------- User Forecast Inputs ---------------------------
+st.header("Make a prediction for a specific date")
+selected_date = st.date_input("Select a date (past or future)", value=last_date.date())
+selected_date = pd.to_datetime(selected_date)
+
+horizon_days = st.slider("Forecast horizon (days ahead when selecting future dates)", min_value=1, max_value=90, value=30)
+
+# If selected_date is after last_date, compute days ahead
+days_ahead = (selected_date - last_date).days
+
+# Predict for selected_date
+if days_ahead <= 0:
+    # historical or last_date: find index in df and predict next value using sequence that ends at that day
+    idx = df.index[df['Date'] == selected_date]
+    if len(idx) == 0:
+        st.warning("Selected historical date not found in dataset. Pick a date that exists in the uploaded CSV or choose a future date.")
+    else:
+        i = idx[0]
+        if i - seq_len < 0:
+            st.warning("Not enough prior history to make a prediction for this date with current sequence length.")
         else:
-            sarima_rmse = sarima_mape = sarima_r2 = None
+            seq_values = scaled[i-seq_len:i]
+            seq_values = seq_values.reshape(1, seq_len, 1)
+            pred_scaled = model.predict(seq_values, verbose=0)[0][0]
+            pred = scaler.inverse_transform(np.array([[pred_scaled]]))[0][0]
+            actual = df.loc[i,'Close']
 
-        # TUNED results summary
-        st.subheader("Model performance on test set")
-        perf_cols = st.columns(3)
-        perf_cols[0].metric("LSTM RMSE", f"{lstm_rmse:.5f}")
-        perf_cols[1].metric("LSTM MAPE (%)", f"{lstm_mape:.3f}")
-        perf_cols[2].metric("LSTM R²", f"{lstm_r2:.4f}")
+            st.subheader(f"Prediction for {selected_date.date()}")
+            col_a, col_b = st.columns([1,2])
+            col_a.metric("Actual", f"{actual:.4f}")
+            col_a.metric("Predicted", f"{pred:.4f}")
 
-        if sarima_fit is not None:
-            st.text("SARIMA (if enabled):")
-            sar_cols = st.columns(3)
-            sar_cols[0].metric("SARIMA RMSE", f"{sarima_rmse:.5f}")
-            sar_cols[1].metric("SARIMA MAPE (%)", f"{sarima_mape:.3f}")
-            sar_cols[2].metric("SARIMA R²", f"{sarima_r2:.4f}")
+            # small plot: actual vs predicted (single point plotted with neighbors)
+            neigh = 5
+            start = max(0, i-neigh)
+            end = min(len(df)-1, i+neigh)
+            fig, ax = plt.subplots(figsize=(3.5,2))
+            ax.plot(df['Date'].iloc[start:end+1], df['Close'].iloc[start:end+1], label='Actual')
+            ax.scatter([selected_date], [actual], color='green', label='Actual (selected)')
+            ax.scatter([selected_date], [pred], color='red', label='Predicted')
+            ax.set_title('Actual vs Pred (small)')
+            ax.tick_params(axis='x', labelrotation=45, labelsize=6)
+            ax.legend(fontsize=6)
+            st.pyplot(fig)
 
-        # Build aligned date index for test predictions
-        # For LSTM we used seq_len so the test predictions correspond to dates starting from index (seq_len + split)
-        total_len = len(values)
-        X_full_len = len(values) - seq_len
-        split_idx = int(X_full_len * 0.8)
-        test_start_idx = seq_len + split_idx  # index in original values where test set starts
-        test_dates = df['Date'].iloc[test_start_idx: test_start_idx + len(y_test)].reset_index(drop=True)
+else:
+    # Future date selected
+    if days_ahead > 90:
+        st.error("This app supports forecasting up to 90 days into the future. Choose a nearer date.")
+    else:
+        # iterative forecast up to days_ahead (or up to horizon_days whichever smaller)
+        steps = min(days_ahead, horizon_days, 90)
+        last_seq = scaled[-seq_len:]
+        future_preds = iterative_forecast(model, last_seq, steps, scaler)
+        pred_for_date = future_preds[days_ahead-1][0] if days_ahead-1 < len(future_preds) else None
 
-        # Create DataFrame showing actual vs predictions (test)
-        test_df = pd.DataFrame({
-            'Date': test_dates,
-            'Actual': y_true,
-            'LSTM_Pred': lstm_pred
-        })
-
-        if sarima_pred is not None and len(sarima_pred) == len(test_df):
-            test_df['SARIMA_Pred'] = sarima_pred
-
-        # Forecast future days
-        # LSTM multi-step forecast using last seq_len values
-        last_seq = scaler.transform(values.reshape(-1,1))[-seq_len:].reshape(1, seq_len, 1)
-        lstm_future = forecast_lstm_sequence(model, last_seq, forecast_days, scaler)
-
-        # SARIMA future forecast
-        sarima_future = None
-        if sarima_fit is not None:
-            try:
-                sarima_future_vals = sarima_fit.forecast(forecast_days)
-                sarima_future = np.array(sarima_future_vals).reshape(-1)
-            except Exception:
-                sarima_future = None
-
-        future_dates = [df['Date'].iloc[-1] + timedelta(days=i) for i in range(1, forecast_days+1)]
-        future_df = pd.DataFrame({
-            'Date': future_dates,
-            'LSTM_Forecast': lstm_future
-        })
-        if sarima_future is not None:
-            future_df['SARIMA_Forecast'] = sarima_future
-
-        # ---------------------------
-        # Specific date handling
-        # ---------------------------
-        selected_dt = pd.to_datetime(specific_date)
-        st.header(f"Selected date: {selected_dt.date()}")
-
-        # If selected date exists in historical df -> show actual and predicted (if in test)
-        if selected_dt in df['Date'].values:
-            idx = df.index[df['Date']==selected_dt][0]
-            actual_val = df.loc[idx,'Close']
-            in_test_range = (idx >= test_start_idx) and (idx < test_start_idx + len(y_test))
-            if in_test_range:
-                # map to test_df row
-                row_idx = idx - test_start_idx
-                pred_lstm_val = test_df.loc[row_idx,'LSTM_Pred']
-                st.markdown(f"**Actual price:** {actual_val:.4f}")
-                st.markdown(f"**LSTM Predicted (test):** {pred_lstm_val:.4f}")
-                if 'SARIMA_Pred' in test_df.columns:
-                    st.markdown(f"**SARIMA Predicted (test):** {test_df.loc[row_idx,'SARIMA_Pred']:.4f}")
-            else:
-                # If it's historical but not in test (train portion)
-                st.markdown(f"**Actual price (train):** {actual_val:.4f}")
-                st.markdown("Prediction not available (selected date is in training portion).")
+        if pred_for_date is None:
+            st.error("Could not forecast for selected date — please try a nearer date or increase horizon.")
         else:
-            # If selected date is in future within forecast horizon, give predicted forecast value
-            days_ahead = (selected_dt - df['Date'].iloc[-1]).days
-            if days_ahead <= 0:
-                st.markdown("Selected date is before the dataset end but not exactly present (maybe weekend). Closest market day predictions are shown below.")
-            if 1 <= days_ahead <= forecast_days:
-                pred_val = future_df.loc[days_ahead-1, 'LSTM_Forecast']
-                st.markdown(f"**Predicted (LSTM) on {selected_dt.date()}:** {pred_val:.4f}")
-                if sarima_future is not None:
-                    st.markdown(f"**Predicted (SARIMA) on {selected_dt.date()}:** {future_df.loc[days_ahead-1, 'SARIMA_Forecast']:.4f}")
-            else:
-                st.markdown("Selected date is outside the future forecast horizon. Please choose a date within the next forecast horizon or a date present in dataset.")
+            st.subheader(f"Prediction for {selected_date.date()} ( {days_ahead} days ahead )")
+            col_a, col_b = st.columns([1,2])
+            col_a.metric("Predicted", f"{pred_for_date:.4f}")
 
-        # ---------------------------
-        # Small actual vs predicted plot centered on selected date
-        # ---------------------------
-        st.subheader("Compact: Actual vs Predicted (around selected date)")
-        # pick a small window of +-7 days around selected date (if available in test_df), otherwise show last 30 days of test
-        window = 7
-        # Merge actual series and predictions across entire test range for indexing ease
-        combined = test_df.copy()
-        # If selected date in combined, center there else show last 30 rows
-        if selected_dt in combined['Date'].values:
-            mid_idx = combined.index[combined['Date']==selected_dt][0]
-            start = max(mid_idx - window, 0)
-            end = min(mid_idx + window + 1, len(combined))
-            plot_df = combined.iloc[start:end]
-        else:
-            plot_df = combined.tail(30)
+            # small selected-day plot: show last 10 days + 30 days forecast
+            recent_days = 10
+            recent_dates = df['Date'].iloc[-recent_days:]
+            recent_actuals = df['Close'].iloc[-recent_days:]
+            future_dates = [last_date + timedelta(days=i+1) for i in range(len(future_preds))]
 
-        fig1, ax1 = plt.subplots(figsize=(4,2.4))
-        ax1.plot(plot_df['Date'], plot_df['Actual'], label='Actual', linewidth=1)
-        ax1.plot(plot_df['Date'], plot_df['LSTM_Pred'], label='LSTM Pred', linewidth=1)
-        if 'SARIMA_Pred' in plot_df.columns:
-            ax1.plot(plot_df['Date'], plot_df['SARIMA_Pred'], label='SARIMA Pred', linewidth=1)
-        ax1.set_xticks(plot_df['Date'][::max(1, len(plot_df)//4)])
-        ax1.tick_params(axis='x', rotation=25, labelsize=7)
-        ax1.set_ylabel("Price", fontsize=8)
-        ax1.legend(fontsize=7, loc='best')
-        plt.tight_layout()
-        st.pyplot(fig1)
+            fig, ax = plt.subplots(figsize=(3.5,2))
+            ax.plot(recent_dates, recent_actuals, label='Recent Actuals')
+            ax.plot(future_dates, future_preds.flatten(), label='Future Preds')
+            ax.axvline(last_date, color='gray', linestyle='--')
+            ax.set_title('Recent + Future (small)')
+            ax.tick_params(axis='x', labelrotation=45, labelsize=6)
+            ax.legend(fontsize=6)
+            st.pyplot(fig)
 
-        # ---------------------------
-        # Small future forecast (first 30 days or user chosen)
-        # ---------------------------
-        st.subheader("Compact: Future forecast (first 30 days or chosen horizon)")
-        small_future_display = min(30, forecast_days)
-        fig2, ax2 = plt.subplots(figsize=(4,2.2))
-        ax2.plot(future_df['Date'].iloc[:small_future_display], future_df['LSTM_Forecast'].iloc[:small_future_display], label='LSTM Forecast', linewidth=1)
-        if 'SARIMA_Forecast' in future_df.columns:
-            ax2.plot(future_df['Date'].iloc[:small_future_display], future_df['SARIMA_Forecast'].iloc[:small_future_display], label='SARIMA Forecast', linewidth=1)
-        ax2.set_xticks(future_df['Date'].iloc[:small_future_display][::max(1, small_future_display//4)])
-        ax2.tick_params(axis='x', rotation=25, labelsize=7)
-        ax2.set_ylabel("Price", fontsize=8)
-        ax2.legend(fontsize=7)
-        plt.tight_layout()
-        st.pyplot(fig2)
+# --------------------------- 30-day small forecast sparkline ---------------------------
+st.markdown("---")
+st.subheader("30-day small forecast")
+with st.spinner("Computing 30-day forecast..."):
+    last_seq = scaled[-seq_len:]
+    spark_preds = iterative_forecast(model, last_seq, 30, scaler)
+    spark_dates = [last_date + timedelta(days=i+1) for i in range(30)]
 
-        # ---------------------------
-        # Full forecast and historical overlay (bigger)
-        # ---------------------------
-        st.subheader("Historical (last 120 days) + Forecast")
-        hist_display = df.tail(120).copy()
-        fig3, ax3 = plt.subplots(figsize=(10,4))
-        ax3.plot(hist_display['Date'], hist_display['Close'], label='Historical', linewidth=1.5)
-        ax3.plot(future_df['Date'], future_df['LSTM_Forecast'], label='LSTM Forecast', linestyle='--')
-        if 'SARIMA_Forecast' in future_df.columns:
-            ax3.plot(future_df['Date'], future_df['SARIMA_Forecast'], label='SARIMA Forecast', linestyle='--')
-        ax3.legend()
-        ax3.set_xlabel("Date")
-        ax3.set_ylabel("Price")
-        plt.tight_layout()
-        st.pyplot(fig3)
+fig2, ax2 = plt.subplots(figsize=(8,2))
+ax2.plot(spark_dates, spark_preds.flatten())
+ax2.set_title('30-day Forecast (small)')
+ax2.tick_params(axis='x', labelrotation=45, labelsize=8)
+st.pyplot(fig2)
 
-        # ---------------------------
-        # Table outputs
-        # ---------------------------
-        st.subheader("Forecast table (first 30 rows shown)")
-        st.dataframe(future_df.head(30))
+# --------------------------- Full forecast up to user-selected days ---------------------------
+st.markdown("---")
+st.header("Full forecast (select up to 90 days)")
+full_days = st.slider("Select days to forecast (full view)", min_value=1, max_value=90, value=30)
 
-        st.success("Done — interact with the controls in the sidebar to re-run with different settings.")
+with st.spinner("Computing full forecast..."):
+    full_preds = iterative_forecast(model, scaled[-seq_len:], full_days, scaler)
+    full_dates = [last_date + timedelta(days=i+1) for i in range(full_days)]
+
+fig3, ax3 = plt.subplots(figsize=(10,4))
+ax3.plot(df['Date'], df['Close'], label='Historical')
+ax3.plot(full_dates, full_preds.flatten(), label='Forecast')
+ax3.set_title(f'Historical + {full_days}-day Forecast')
+ax3.legend()
+st.pyplot(fig3)
+
+st.markdown("---")
+st.caption("Notes: The app trains a LSTM model on the provided CSV. For production use, train offline and provide a saved model (lstm_model.h5) to the working directory, or enable retrain and increase epochs in the sidebar.")
+
+# Provide download links for forecasts
+if st.button("Download 30-day forecast CSV"):
+    out_df = pd.DataFrame({'Date': spark_dates, 'Predicted_Close': spark_preds.flatten()})
+    out_csv = out_df.to_csv(index=False).encode('utf-8')
+    st.download_button("Click to download", data=out_csv, file_name='30_day_forecast.csv', mime='text/csv')
+
+# End of app
