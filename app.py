@@ -188,4 +188,35 @@ if days_ahead <= 0 and len(idx) > 0:
 
 elif days_ahead > 0 and days_ahead <= 90:
     fig = go.Figure()
-    past_dates = df["Dat]()_
+    past_dates = df["Date"].iloc[-30:]
+    past_values = df["Close"].iloc[-30:]
+    fig.add_trace(go.Scatter(x=past_dates, y=past_values, mode='lines', name='Historical Close'))
+
+    future_dates = [last_date + timedelta(days=i + 1) for i in range(days_ahead)]
+    fig.add_trace(go.Scatter(x=future_dates, y=future_preds[:days_ahead].flatten(),
+                             mode='lines+markers', name='Predicted'))
+
+    fig.update_layout(
+        title=f"Forecast up to {selected_date.date()}",
+        xaxis_title="Date",
+        yaxis_title="Close Price",
+        showlegend=True
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# --------------------------- 30-Day Forecast Download ---------------------------
+st.header("Download 30-Day Forecast")
+
+future30 = iterative_forecast(model, scaled[-seq_len:], 30, scaler)
+dates30 = [last_date + timedelta(days=i + 1) for i in range(30)]
+df30 = pd.DataFrame({"Date": dates30, "Predicted_Close": future30.flatten()})
+csv30 = df30.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    "⬇ Download 30-Day Forecast CSV",
+    data=csv30,
+    file_name="30_day_forecast.csv",
+    mime="text/csv"
+)
+
+st.success("App ready. Forecasting complete.")
